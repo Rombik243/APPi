@@ -1,136 +1,115 @@
-from pydantic import BaseModel, Field, field_validator
-from fastapi import FastAPI, HTTPException
-from datetime import datetime
-from typing import Optional
-import os
-from sqlalchemy import inspect, text
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
-from sqlalchemy import select, insert
-import asyncio
+from sqlalchemy import create_engine, Column, Integer, String
+from sqlalchemy.orm import declarative_base, sessionmaker, Mapped, mapped_column, Session    
+from fastapi import Depends, FastAPI, HTTPException
+from pydantic import BaseModel
+import uvicorn
 
-# Настройки БД
-DB_PATH = "mydatabase.db"
-DATABASE_URL = f"sqlite+aiosqlite:///{DB_PATH}"
 
-# Инициализация движка
-engine = create_async_engine(DATABASE_URL)
-async_session = sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+# Настройка подключения к SQLite (файл mydb.db)
+engine = create_engine("sqlite:///mydatab.db")
+Base = declarative_base()  # ← База для моделей
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
-class Base(DeclarativeBase):
-    pass
+def get_db():
+    # Этап 1: Создание сессии (при вызове Depends(get_db))
+    db = SessionLocal()  # ← Сессия открыта
 
-class Task(Base):
-    __tablename__ = "tasks"
-    id: Mapped[int] = mapped_column(primary_key=True)
-    category: Mapped[Optional[str]]
-    title: Mapped[str] = mapped_column(nullable=False)
-    description: Mapped[str]
-    status: Mapped[bool]
-    priority: Mapped[Optional[int]]
-    deadline: Mapped[Optional[str]]
-    percent: Mapped[int] = mapped_column(default=0)
+    try:
+        # Этап 2: Передача сессии в эндпоинт
+        yield db  # ← Сессия "заморожена" и используется в запросе
+
+    finally:
+        # Этап 3: Закрытие сессии (после завершения эндпоинта)
+        db.close()  # ← Сессия закрыта
+
+# Описываем таблицу "users" как класс
+class User(Base):
+    __tablename__ = "users"
+    id : Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    name : Mapped[str]
+    email : Mapped[str]
+    password : Mapped[str]
+
+# Создаём таблицы в БД
+Base.metadata.create_all(engine)
 
 app = FastAPI()
 
-@app.on_event("startup")
-async def startup_event():
-    """Инициализация при старте"""
-    print("Запуск инициализации БД...")
-    try:
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-            print("Таблицы созданы")
+# Схема для создания (клиент → сервер)
+class UserCreate(BaseModel):
+    name: str
+    email: str
+    password: str  # В реальном проекте хэшируйте!
 
-        # Проверяем сразу после создания
-        await check_db_internal()
-    except Exception as e:
-        print(f"Ошибка инициализации БД: {e}")
-        raise
+# Схема для ответа (сервер → клиент)
+class UserResponse(BaseModel):
+    id: int  # Добавляем id, который вернёт БД
+    name: str
+    email: str
+        
 
-async def check_db_internal():
-    """Внутренняя функция проверки"""
-    print("\nПроверка БД...")
-    try:
-        # Проверка файла
-        db_exists = os.path.exists(DB_PATH)
-        print(f"Файл БД существует: {db_exists}")
+@app.post("/users", response_model = UserResponse)
+def create_user(user: UserCreate, db: Session = Depends(get_db)):
+    db_user = User(name = user.name, email = user.email, password = user.password)
 
-        if not db_exists:
-            raise Exception("Файл БД не найден")
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user) # Refresh the object to get the id
+    return UserResponse(id=db_user.id, name=db_user.name, email=db_user.email)
+    
+@app.get("/")
+def read_root():
+    return {"Hello": "World"}
 
-        # Проверка таблиц
-        async with engine.begin() as conn:
-            inspector = await conn.run_sync(lambda c: inspect(c))
-            tables = inspector.get_table_names()
-            print(f"Найдены таблицы: {tables}")
 
-            if "tasks" not in tables:
-                raise Exception("Таблица 'tasks' отсутствует")
+@app.get("/users/all_users", response_model=list[UserResponse])
+def get_all_users(db: Session = Depends(get_db)):
+    users = db.query(User).all()
 
-        # Тестовый запрос
-        async with async_session() as session:
-            await session.execute(text("SELECT 1 FROM tasks LIMIT 1"))
-            print("Тестовый запрос выполнен успешно")
+    if not users:
+        raise HTTPException(status_code=404, detail="User not found")
 
-        return True
-    except Exception as e:
-        print(f"Ошибка проверки БД: {e}")
-        return False
+    return users
 
-@app.get("/check-db")
-async def check_db():
-    """Публичный эндпоинт для проверки"""
-    try:
-        is_ok = await check_db_internal()
-        if not is_ok:
-            raise HTTPException(status_code=500, detail="Проверка БД не пройдена")
+@app.get("/users/{user_id}", response_model=UserResponse)
+def get_user(user_id: int, db: Session = Depends(get_db)):
+    user = db.query(User).get(user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
 
-        return {
-            "status": "success",
-            "db_file": os.path.abspath(DB_PATH),
-            "tables": ["tasks"],
-            "message": "База данных работает корректно"
-        }
-    except Exception as e:
+    return user
+
+@app.delete("/users/{user_id}")  # ← Добавлен / перед users
+def delete_user(user_id: int, db: Session = Depends(get_db)):
+    deleted_count = db.query(User).filter(User.id == user_id).delete()
+    db.commit()
+
+    if not deleted_count:  # Более питонический вариант проверки
         raise HTTPException(
-            status_code=500,
-            detail=f"Ошибка БД: {str(e)}"
+            status_code=404,
+            detail=f"User with ID {user_id} not found"
         )
 
-@app.post("/tasks")
-async def create_task(task: dict):
-    """Тестовый метод для создания записи"""
-    async with async_session() as session:
-        try:
-            new_task = Task(**task)
-            session.add(new_task)
-            await session.commit()
-            return {"status": "success", "id": new_task.id}
-        except Exception as e:
-            await session.rollback()
-            raise HTTPException(status_code=400, detail=str(e))
+    return {"detail": f"User {user_id} successfully deleted"}
 
-@app.get("/tasks")
-async def get_tasks():
-    """Получение всех задач"""
-    async with async_session() as session:
-        result = await session.execute(select(Task))
-        tasks = result.scalars().all()
-        return {"tasks": [{"id": t.id, "title": t.title} for t in tasks]}
+#обновление данных
+@app.put("/users/{user_id}", response_model=UserResponse)
+def update_user(user_id: int, user: UserCreate, db: Session = Depends(get_db)):
+    db_user = db.query(User).get(user_id)
+    if not db_user:
+        raise HTTPException(status_code=404, detail="User not found")
+    db_user.name = user.name
+    db_user.email = user.email
+    db_user.password = user.password
+    db.commit()
+    db.refresh(db_user)
+    return UserResponse(id=db_user.id, name=db_user.name, email=db_user.email)
 
-@app.get("/")
-async def read_root():
-    return {
-        "message": "Используйте /check-db для проверки БД",
-        "endpoints": [
-            {"method": "GET", "path": "/check-db", "desc": "Проверка состояния БД"},
-            {"method": "POST", "path": "/tasks", "desc": "Создать задачу"},
-            {"method": "GET", "path": "/tasks", "desc": "Список задач"}
-        ]
-    }
+
+# @app.delete("/users/{user_id}")
+# def del_user(user_id: int, )
+
 
 if __name__ == "__main__":
-    import uvicorn
-    print(f"\nЗапуск сервера. БД: {os.path.abspath(DB_PATH)}")
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
